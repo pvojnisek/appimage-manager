@@ -33,11 +33,11 @@ try:
 except ImportError:
     fcntl = None  # Non-Linux: file locking disabled
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 CSV_FIELDS = [
     "id", "label", "filename", "symlink", "icon",
-    "categories", "terminal", "status", "created_at", "updated_at",
+    "categories", "startup_wm_class", "terminal", "status", "created_at", "updated_at",
 ]
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
@@ -140,6 +140,90 @@ def save_registry(csv_path, records):
         lockfile.unlink(missing_ok=True)
 
 
+# ─── XDG icon management ─────────────────────────────────────────────────────
+
+_HICOLOR_BASE = Path.home() / ".local/share/icons/hicolor"
+_PNG_HEADER = b"\x89PNG\r\n\x1a\n"
+
+
+def _get_png_size(path):
+    """Read width from PNG header. Returns size or 256 as fallback."""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            header = f.read(24)
+        if header[:8] == _PNG_HEADER:
+            return struct.unpack(">I", header[16:20])[0]
+    except OSError:
+        pass
+    return 256
+
+
+def _is_svg(path):
+    """Check if file is SVG regardless of extension."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(256)
+        return b"<svg" in header or b"<?xml" in header
+    except OSError:
+        return False
+
+
+def _icon_name(app_id):
+    """Generate the freedesktop icon name for an app."""
+    return f"appimage-{app_id}"
+
+
+def _install_icon_to_hicolor(icon_file, app_id):
+    """Install an icon into the XDG hicolor theme. Returns icon name or None."""
+    name = _icon_name(app_id)
+
+    if _is_svg(icon_file):
+        dest_dir = _HICOLOR_BASE / "scalable/apps"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{name}.svg"
+        shutil.copy2(icon_file, dest)
+    else:
+        size = _get_png_size(icon_file)
+        dest_dir = _HICOLOR_BASE / f"{size}x{size}/apps"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{name}.png"
+        shutil.copy2(icon_file, dest)
+
+    return name
+
+
+def _uninstall_icon_from_hicolor(app_id):
+    """Remove all icon files for an app from the hicolor theme."""
+    name = _icon_name(app_id)
+    removed = False
+    if _HICOLOR_BASE.exists():
+        for icon_file in _HICOLOR_BASE.rglob(f"{name}.*"):
+            if icon_file.is_file():
+                icon_file.unlink()
+                removed = True
+    return removed
+
+
+def _has_hicolor_icon(app_id):
+    """Check if an icon is installed in the hicolor theme."""
+    name = _icon_name(app_id)
+    if not _HICOLOR_BASE.exists():
+        return False
+    return any(_HICOLOR_BASE.rglob(f"{name}.*"))
+
+
+def _update_icon_cache():
+    """Refresh the GTK icon cache for the hicolor theme."""
+    try:
+        subprocess.run(
+            ["gtk-update-icon-cache", "-f", "-t", str(_HICOLOR_BASE)],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        pass
+
+
 # ─── Icon extraction ─────────────────────────────────────────────────────────
 
 def _is_safe_path(path, root):
@@ -153,21 +237,12 @@ def _is_safe_path(path, root):
 def _safe_copy(src, dest, root):
     """Copy src to dest only if src is safely inside root.
 
-    If the source is actually SVG (regardless of extension), renames
-    dest to .svg so desktop launchers can render it correctly.
-    Returns the final destination path, or None on failure.
+    Returns dest path on success, or None on failure.
     """
     if not _is_safe_path(src, root):
         return None
     try:
         shutil.copy2(src, dest)
-        # Detect SVG masquerading as PNG
-        with open(dest, "rb") as f:
-            header = f.read(256)
-        if b"<svg" in header or b"<?xml" in header:
-            svg_dest = dest.with_suffix(".svg")
-            dest.rename(svg_dest)
-            return svg_dest
         return dest
     except OSError:
         return None
@@ -216,8 +291,8 @@ def _extract_best_hicolor(appimage_path, icon_name, icon_dest, tmpdir, sqroot):
 
 
 def _read_embedded_desktop(appimage_path, tmpdir, sqroot):
-    """Extract and parse the embedded .desktop file. Returns dict with Icon and Categories."""
-    result = {"icon_name": None, "categories": None}
+    """Extract and parse the embedded .desktop file."""
+    result = {"icon_name": None, "categories": None, "startup_wm_class": None}
     _appimage_extract(appimage_path, "*.desktop", tmpdir)
     for desktop_file in sqroot.glob("*.desktop"):
         if desktop_file.is_symlink() and not desktop_file.exists():
@@ -237,6 +312,8 @@ def _read_embedded_desktop(appimage_path, tmpdir, sqroot):
                 result["icon_name"] = stripped.split("=", 1)[1].strip()
             elif stripped.startswith("Categories="):
                 result["categories"] = stripped.split("=", 1)[1].strip()
+            elif stripped.startswith("StartupWMClass="):
+                result["startup_wm_class"] = stripped.split("=", 1)[1].strip()
         if result["icon_name"]:
             break
     return result
@@ -293,7 +370,11 @@ def extract_metadata(appimage_path, app_id, icons_dir):
                     appimage_path, icon_name, icon_dest, tmpdir, sqroot,
                 )
 
-        return {"icon": icon_result, "categories": categories}
+        return {
+            "icon": icon_result,
+            "categories": categories,
+            "startup_wm_class": desktop_info.get("startup_wm_class"),
+        }
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -302,15 +383,13 @@ def extract_metadata_for_records(apps_dir, records, cfg, force=False):
     """Extract icons and categories for records missing them."""
     icons_dir = apps_dir / cfg["icons_dir"]
     extracted = failed = 0
+    icons_changed = False
     appimage_tag = cfg.get("appimage_tag", "X-AppImage;")
 
     for rec in records:
         if rec["status"] == "removed" and not force:
             continue
-        has_icon = (
-            (icons_dir / f"{rec['id']}.png").exists()
-            or (icons_dir / f"{rec['id']}.svg").exists()
-        ) and not force
+        has_icon = _has_hicolor_icon(rec["id"]) and not force
         has_categories = appimage_tag in rec.get("categories", "") and not force
         if has_icon and has_categories:
             continue
@@ -332,7 +411,16 @@ def extract_metadata_for_records(apps_dir, records, cfg, force=False):
         now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
         if meta["icon"]:
-            rec["icon"] = str(meta["icon"])
+            # Install icon to XDG hicolor theme
+            try:
+                icon_name = _install_icon_to_hicolor(meta["icon"], rec["id"])
+                rec["icon"] = icon_name
+                icons_changed = True
+            except OSError:
+                rec["icon"] = _icon_name(rec["id"])
+            updated = True
+        if meta.get("startup_wm_class"):
+            rec["startup_wm_class"] = meta["startup_wm_class"]
             updated = True
         if meta["categories"]:
             cats = meta["categories"].rstrip(";") + ";" + appimage_tag
@@ -349,6 +437,9 @@ def extract_metadata_for_records(apps_dir, records, cfg, force=False):
         else:
             print(f" {color('not found', YELLOW)}")
             failed += 1
+
+    if icons_changed:
+        _update_icon_cache()
 
     return extracted, failed
 
@@ -405,8 +496,9 @@ def scan(apps_dir, records, cfg):
                 "label": extract_label(latest.name),
                 "filename": latest.name,
                 "symlink": f"{app_id}.AppImage",
-                "icon": app_id,
+                "icon": _icon_name(app_id),
                 "categories": cfg["default_categories"],
+                "startup_wm_class": "",
                 "terminal": cfg["default_terminal"],
                 "status": "active",
                 "created_at": now,
@@ -432,23 +524,28 @@ def scan(apps_dir, records, cfg):
 
 def generate_desktop(rec, symlink_path, cfg):
     """Generate .desktop file content."""
-    return (
-        "[Desktop Entry]\n"
-        "# Managed by appimage-manager.py\n"
-        "Type=Application\n"
-        f"Name={rec['label']}\n"
-        f"Exec={symlink_path} %U\n"
-        f"TryExec={symlink_path}\n"
-        f"Icon={rec['icon']}\n"
-        f"Terminal={'true' if rec['terminal'] == 'true' else 'false'}\n"
-        f"Categories={rec['categories']}\n"
-    )
+    lines = [
+        "[Desktop Entry]",
+        "# Managed by appimage-manager.py",
+        "Type=Application",
+        f"Name={rec['label']}",
+        f"Exec={symlink_path} %U",
+        f"TryExec={symlink_path}",
+        f"Icon={rec['icon']}",
+        f"Terminal={'true' if rec['terminal'] == 'true' else 'false'}",
+        f"Categories={rec['categories']}",
+    ]
+    wm_class = rec.get("startup_wm_class", "")
+    if wm_class:
+        lines.append(f"StartupWMClass={wm_class}")
+    return "\n".join(lines) + "\n"
 
 
 def sync(apps_dir, desktop_dir, records, cfg, dry_run=False):
     """Sync symlinks and .desktop files from registry. Returns action count."""
     desktop_dir.mkdir(parents=True, exist_ok=True)
     actions = 0
+    icons_changed = False
     prefix = cfg["desktop_prefix"]
 
     for rec in records:
@@ -507,8 +604,17 @@ def sync(apps_dir, desktop_dir, records, cfg, dry_run=False):
                     desktop_path.unlink()
                 print(f"  {color('REMOVE', RED)} {desktop_path.name}")
                 actions += 1
+            # Remove icon from hicolor theme
+            if _has_hicolor_icon(rec["id"]):
+                if not dry_run:
+                    _uninstall_icon_from_hicolor(rec["id"])
+                    icons_changed = True
+                print(f"  {color('REMOVE', RED)} icon {_icon_name(rec['id'])}")
+                actions += 1
 
     if actions > 0 and not dry_run:
+        if icons_changed:
+            _update_icon_cache()
         try:
             subprocess.run(
                 ["update-desktop-database", str(desktop_dir)],
